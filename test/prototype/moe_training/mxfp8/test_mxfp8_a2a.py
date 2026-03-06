@@ -69,6 +69,7 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
 
             tokens_per_ep_rank = 8192
             dim = 2048
+            num_experts_per_rank = 2
             input_tensor = torch.randn(
                 tokens_per_ep_rank,
                 dim,
@@ -78,21 +79,38 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
             )
             ref_input_tensor = input_tensor.detach().clone().requires_grad_(True)
 
-            # Generate random input splits that sum to tokens_per_ep_rank
-            num_splits = self.world_size
-            input_splits = generate_split_sizes(
-                num_splits, tokens_per_ep_rank, self.device
+            # Generate random expert splits per rank that sum to tokens_per_ep_rank
+            # Shape: (world_size, num_experts_per_rank)
+            expert_splits_per_rank = torch.zeros(
+                self.world_size,
+                num_experts_per_rank,
+                dtype=torch.int64,
+                device=self.device,
             )
+            for rank_idx in range(self.world_size):
+                expert_splits_per_rank[rank_idx, :] = generate_split_sizes(
+                    num_experts_per_rank, tokens_per_ep_rank, self.device
+                )
+
+            # Compute input_splits from expert_splits_per_rank (sum across experts)
+            input_splits = expert_splits_per_rank.sum(dim=1)
 
             # Max output tokens per rank is worst case where one rank receives all tokens
-            max_output_tokens_per_rank = tokens_per_ep_rank * self.world_size
+            # With padding to multiple of 32, we need more space
+            max_output_tokens_per_rank = (
+                tokens_per_ep_rank * self.world_size
+                + 32 * num_experts_per_rank * self.world_size
+            )
 
             # Test forward
-            output, output_splits = mxfp8_on_device_all_to_all_v(
-                input_tensor,
-                input_splits,
-                max_output_tokens_per_rank,
-                group_name,
+            output, output_splits, output_expert_splits, expert_padded_offsets = (
+                mxfp8_on_device_all_to_all_v(
+                    input_tensor,
+                    input_splits,
+                    max_output_tokens_per_rank,
+                    expert_splits_per_rank,
+                    group_name,
+                )
             )
 
             # Reference torch.all_to_all_single to compare against
@@ -118,9 +136,33 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
                 dist.group.WORLD,
             )
 
+            # Compute reference expert splits using all-to-all
+            # Each rank sends expert_splits_per_rank[:, local_rank] to gather what each remote rank is sending to us
+            output_expert_splits_ref = torch.empty_like(output_expert_splits)
+            for remote_rank in range(self.world_size):
+                # Gather expert splits from each remote rank
+                gathered_expert_splits = torch.empty(
+                    self.world_size,
+                    num_experts_per_rank,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered_expert_splits,
+                    expert_splits_per_rank,
+                    group=dist.group.WORLD,
+                )
+                # Extract the expert splits that remote_rank is sending to us
+                output_expert_splits_ref[remote_rank, :] = gathered_expert_splits[
+                    remote_rank, self.rank, :
+                ]
+
             # Compare output
             assert torch.equal(output_splits, output_splits_ref), (
                 "output_splits mismatch"
+            )
+            assert torch.equal(output_expert_splits, output_expert_splits_ref), (
+                f"output_expert_splits mismatch: got {output_expert_splits}, expected {output_expert_splits_ref}"
             )
             out_no_padding = output[:total_tokens_on_rank_after_a2a]
             sqnr = compute_error(ref_output, out_no_padding)
