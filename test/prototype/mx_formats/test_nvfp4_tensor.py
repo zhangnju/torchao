@@ -369,6 +369,8 @@ def test_nvfp4_swizzled_scales_get_scales_method():
 @torch.no_grad()
 def test_triton_nvfp4_quantize_equivalence(M, N, use_per_tensor_scale, dtype):
     """Test that Triton and PyTorch NVFP4 quantization produce equivalent results."""
+    if not use_per_tensor_scale:
+        pytest.skip("MSLK triton kernel requires per_tensor_scale")
 
     torch.manual_seed(42)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
@@ -559,8 +561,14 @@ def test_scale_shape_matches_qdata(
     block_size = 16
 
     x_hp = torch.randn(*shape, device="cuda")
+
+    per_tensor_scale = per_tensor_amax_to_scale(torch.amax(torch.abs(x_hp)))
+
     x = NVFP4Tensor.to_nvfp4(
-        x_hp, is_swizzled_scales=is_swizzled_scales, use_triton_kernel=use_triton_kernel
+        x_hp,
+        per_tensor_scale=per_tensor_scale,
+        is_swizzled_scales=is_swizzled_scales,
+        use_triton_kernel=use_triton_kernel,
     )
 
     if len(shape) == 2:
